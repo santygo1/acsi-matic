@@ -6,7 +6,9 @@ import ru.danilspirin.cache.RedisCache;
 import ru.danilspirin.dictionary.SynonymDictionary;
 import ru.danilspirin.dictionary.YandexSynonymDictionary;
 
-import java.io.*;
+import java.io.FileNotFoundException;
+import java.io.InputStream;
+import java.io.OutputStream;
 import java.net.http.HttpClient;
 
 public class Main {
@@ -20,8 +22,9 @@ public class Main {
                 new RedisCache<>(redis, "synonyms")
         );
 
-        InputStream input = new FileInputStream("input-file.txt");
-        OutputStream output = new FileOutputStream("abstract-file.txt");
+
+        InputStream input = Main.class.getResourceAsStream("/example.txt");
+        OutputStream output = System.out;
 
         new AcsiMatic(wordSynonymAnalyzer)
                 .useMaxAbstractSize(50)
