@@ -6,6 +6,7 @@ import ru.danilspirin.dictionary.SynonymDictionary;
 
 import java.io.*;
 import java.util.*;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 
@@ -44,7 +45,8 @@ public class AcsiMatic implements AbstractingMethod {
         log.info("Начало реферирования...");
         readText(input);
         // Вычисляем допустимую длину исходного реферата и сокращаем длину всех отобранных предложений
-        int maxAbstractSentenceCount = originalSentencesOrderList.size() * (maxAbstractSizeInPercent / 100);
+        System.out.println(originalSentencesOrderList.size() + " " + maxAbstractSizeInPercent / 100);
+        int maxAbstractSentenceCount = (int) (originalSentencesOrderList.size() * ((double) maxAbstractSizeInPercent / 100));
         log.info("Количество предложений выходного реферата ({}% от исходного текста): {}",
                 maxAbstractSizeInPercent, maxAbstractSentenceCount);
 
@@ -55,7 +57,7 @@ public class AcsiMatic implements AbstractingMethod {
         double maxRating = 0;
         for (Sentence sentence : originalSentencesOrderList) {
             double sentenceRating = sentence.updateRating(wordsPool);
-            avgRating += sentenceRating;
+
             if (maxRating < sentenceRating) {
                 maxRating = sentenceRating;
             }
@@ -78,13 +80,9 @@ public class AcsiMatic implements AbstractingMethod {
 
         // Классифицируем предложения на главные и резервные
         // Все главные предложения маркируются - избыточные, не избыточные
-        log.info("Классификация предложений - основные и резервные");
-        log.info("Определение избыточности основных предложений с помощью словаря синонимов {}", synonymDictionary);
         classifyAndMarkSentences(generalSentences, reserveSentences);
 
-
         // Удаляем избыточность
-        log.info("Удаление избыточных предложений");
         Set<Sentence> resultAbstractSentences = removeOversupply(generalSentences, reserveSentences);
 
         // Выделяем все отобранные слова из оригинального текста с соблюдением последовательности
@@ -94,6 +92,12 @@ public class AcsiMatic implements AbstractingMethod {
         if (resultAbstract.size() < maxAbstractSentenceCount) {
             // Вычисляем с какой периодичностью мы будем брать предложения
             int nth = 100 / maxAbstractSizeInPercent;
+            log.info(
+                    "Количество отобранных предложений превышает {}% исходного текста.",
+                    maxAbstractSizeInPercent
+            );
+            log.info("Выбираем каждое {} из отобранных", nth);
+
             resultAbstract = IntStream.range(0, resultAbstract.size())
                     .filter(n -> n % nth == 0)
                     .mapToObj(resultAbstract::get)
@@ -107,13 +111,15 @@ public class AcsiMatic implements AbstractingMethod {
     // Классифицируем предложения на главные и резервные
     // и маркирует избыточные предложения которые попадают в класс главных
     private void classifyAndMarkSentences(Set<MarkedSentence> generalSentences, Set<Sentence> reserveSentences) {
+        log.info("Классификация предложений - основные и резервные");
+        log.info("Определение избыточности основных предложений с помощью словаря синонимов {}", synonymDictionary);
         originalSentencesOrderList.forEach(s -> {
             if (s.rating > reserveSentenceRatingUpperBound) {
                 // Если предложение главное
                 // На каждое предложение вешаем маркер - избыточное или нет
                 var ms = new MarkedSentence(s);
 
-                // Каждое предложение проверяем на избыточность ко всем уже добавленным предложениям
+                // Каждое предложение проверяем на избыточность со всеми уже добавленными не избыточными предложениям
                 Iterator<MarkedSentence> generalIter = generalSentences.iterator();
                 while (!ms.isOversupply && generalIter.hasNext()) {
                     MarkedSentence g = generalIter.next();
@@ -130,25 +136,23 @@ public class AcsiMatic implements AbstractingMethod {
                 reserveSentences.add(s);
             }
         });
-        log.debug("Список основных предложений: ");
-        for (MarkedSentence general : generalSentences) {
-            log.debug("{}", general);
-        }
-        log.debug("Список \"резервных\" предложений: ");
-        for (Sentence reserve : reserveSentences) {
-            log.debug("{}", reserve);
-        }
     }
 
     // Заменяет избыточные предложения предложениями из резерва пока они не закончатся
     private Set<Sentence> removeOversupply(Set<MarkedSentence> general, Set<Sentence> reserve) {
+        log.info("Количество главных предложений: {}", general.size());
+        log.info("Количество \"резервных\" предложений: {}", reserve.size());
+
+        log.info("Удаление избыточных предложений");
         Iterator<Sentence> reserveIter = reserve.iterator();
+        AtomicInteger countReplaced = new AtomicInteger();
         Set<Sentence> withoutOversupply = general.stream()
                 .map(s -> {
                     // Если избыточность, то смотрим есть ли резервные
                     // есть -> значит возвращаем
                     // если нет -> возвращаем предложение, несмотря на его избыточность
                     if (s.isOversupply && reserveIter.hasNext()) {
+                        countReplaced.getAndIncrement();
                         return reserveIter.next();
                     } else {
                         return s.sentence;
@@ -156,10 +160,7 @@ public class AcsiMatic implements AbstractingMethod {
                 })
                 .collect(Collectors.toSet());
 
-        log.debug("Оставшиеся предложения после удаления избыточности:");
-        for (Sentence sentence : withoutOversupply) {
-            log.debug("{}", sentence);
-        }
+        log.info("Количество замен избыточных главных предложений на резервные: {}", countReplaced);
 
         return withoutOversupply;
     }
@@ -167,17 +168,9 @@ public class AcsiMatic implements AbstractingMethod {
     // Проверяет избыточность двух предложений и если
     // хотя бы одно из предложений избыточно ему устанавливается флаг
     private void checkAndSetOversupplyFlags(MarkedSentence first, MarkedSentence second) {
-        // Если два предложения равны, помечаем одно из них как избыточное
+        // Если одно и то же предложение - ничего не делаем
         if (first == second) {
-            second.isOversupply = true;
             return;
-        }
-        // если количество слов в первом больше чем количество слов во втором предложении,
-        // то меняем ссылки местами
-        if (first.sentence.words.size() > second.sentence.words.size()) {
-            MarkedSentence tmp = second;
-            second = first;
-            first = tmp;
         }
 
         // Количество синонимов для слов из первого предложения, которые были найдены во втором
@@ -194,9 +187,12 @@ public class AcsiMatic implements AbstractingMethod {
             }
         }
 
-        // Устанавливаем флаги избыточности для предложений
-        first.isOversupply = countSynonymsInSentence / first.sentence.words.size() < MAX_SENTENCE_OVERSUPPLY_IN_PERCENT / 100;
-        second.isOversupply = countSynonymsInSentence / second.sentence.words.size() < MAX_SENTENCE_OVERSUPPLY_IN_PERCENT / 100;
+        // Определяем процент синонимов в первом и втором предложениях,
+        // маркируем избыточным если превысило допустимый процент
+        int firstSynonymsPercent = (int) ((double) countSynonymsInSentence / first.sentence.words.size() * 100);
+        first.isOversupply = firstSynonymsPercent > MAX_SENTENCE_OVERSUPPLY_IN_PERCENT;
+        int secondSynonymsPercent = (int) ((double) countSynonymsInSentence / second.sentence.words.size() * 100);
+        second.isOversupply = secondSynonymsPercent > MAX_SENTENCE_OVERSUPPLY_IN_PERCENT;
     }
 
     private List<Sentence> getHighlightedSentencesFromText(List<Sentence> textSentences,
@@ -211,13 +207,21 @@ public class AcsiMatic implements AbstractingMethod {
         // Считываем предложения из текста и формируем пул всех слов и список предложений в оригинальном порядке
         Scanner sc = new Scanner(input).useDelimiter("\\s*[.!?]");
         while (sc.hasNext()) {
-            String sentenceOriginal = sc.next(),
-                    endSymbol = sc.findInLine("[.!?]");
+            String sentenceOriginal = sc.next();
+            // Пропускаем если предложение пустое
+            if (sentenceOriginal.trim().equals(""))
+                continue;
+
+            String endSymbol = sc.findInLine("[.!?]");
+
+            // Создаем и добавляем предложение в пул всех предложений
             Sentence sentence = new Sentence(sentenceOriginal + (endSymbol != null ? endSymbol : ""));
+            originalSentencesOrderList.add(sentence);
+
+            // Добавляем каждое слово из предложения в пул, или увеличиваем счетчик вхождения слова
             for (String word : sentence.words) {
                 wordsPool.addWord(word);
             }
-            originalSentencesOrderList.add(sentence);
         }
         log.info("Количество предложений входного текста: {}", originalSentencesOrderList.size());
     }
