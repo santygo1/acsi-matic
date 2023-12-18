@@ -2,13 +2,13 @@ package ru.danilspirin;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.yaml.snakeyaml.error.Mark;
 import ru.danilspirin.dictionary.SynonymDictionary;
 
 import java.io.*;
 import java.util.*;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
-import java.util.stream.IntStream;
 
 public class AcsiMatic implements AbstractingMethod {
 
@@ -23,6 +23,7 @@ public class AcsiMatic implements AbstractingMethod {
 
     // Максимальный размер реферата от исходного текста
     private int maxAbstractSizeInPercent = DEFAULT_ABSTRACT_SIZE_IN_PERCENT;
+    private int maxAbstractSentenceCount;
 
     // Нижняя и верхняя граница рейтинга для резервных предложений
     private double reserveSentenceRatingUpperBound, reserveSentenceRatingLowerBound;
@@ -31,7 +32,7 @@ public class AcsiMatic implements AbstractingMethod {
         this.synonymDictionary = synonymDictionary;
     }
 
-    public AbstractingMethod useMaxAbstractSize(int abstractSizeInPercent) {
+    public AbstractingMethod useAbstractLimit(int abstractSizeInPercent) {
         if (0 < abstractSizeInPercent && abstractSizeInPercent < 100) {
             this.maxAbstractSizeInPercent = abstractSizeInPercent;
             return this;
@@ -44,10 +45,9 @@ public class AcsiMatic implements AbstractingMethod {
     public void process(InputStream input, OutputStream output) {
         log.info("Начало реферирования...");
         readText(input);
-        // Вычисляем допустимую длину исходного реферата и сокращаем длину всех отобранных предложений
-        System.out.println(originalSentencesOrderList.size() + " " + maxAbstractSizeInPercent / 100);
-        int maxAbstractSentenceCount = (int) (originalSentencesOrderList.size() * ((double) maxAbstractSizeInPercent / 100));
-        log.info("Количество предложений выходного реферата ({}% от исходного текста): {}",
+
+        maxAbstractSentenceCount = (int) (originalSentencesOrderList.size() * ((double) maxAbstractSizeInPercent / 100));
+        log.info("Ожидаемое количество предложений выходного реферата ({}% от исходного текста): {}",
                 maxAbstractSizeInPercent, maxAbstractSentenceCount);
 
         // Обновляем рейтинг предложений с учетом сформированного пула слов с рейтингом
@@ -57,112 +57,151 @@ public class AcsiMatic implements AbstractingMethod {
         double maxRating = 0;
         for (Sentence sentence : originalSentencesOrderList) {
             double sentenceRating = sentence.updateRating(wordsPool);
-
+            avgRating+=sentenceRating;
             if (maxRating < sentenceRating) {
                 maxRating = sentenceRating;
             }
         }
-        avgRating = avgRating / originalSentencesOrderList.size();
 
+        avgRating = avgRating / originalSentencesOrderList.size();
         // delta для avg
         double reserveBorderOffset = (maxRating - avgRating) * ((double) (RESERVE_BORDER_OFFSET_IN_PERCENT / 2) / 100);
         reserveSentenceRatingUpperBound = avgRating + reserveBorderOffset;
         reserveSentenceRatingLowerBound = avgRating - reserveBorderOffset;
-        log.info("Диапазон главных предложений: ({}, {}]", reserveSentenceRatingUpperBound, maxRating);
-        log.info("Диапазон \"резервных\" предложений: [{}, {}]", reserveSentenceRatingLowerBound, reserveSentenceRatingUpperBound);
+        // Если все предложения равны между собой смещаем границы вниз
+        if (avgRating == maxRating){
+            log.info("Все предложения равны по рейтингу - средняя граница была смещена вниз!");
+            avgRating = maxRating/2;
+            reserveBorderOffset = (maxRating - avgRating) * ((double) (RESERVE_BORDER_OFFSET_IN_PERCENT / 2) / 100);;
+            reserveSentenceRatingUpperBound = avgRating + reserveBorderOffset;
+            reserveSentenceRatingLowerBound = avgRating - reserveBorderOffset;
+        }
+
+        log.info("\tДиапазон главных предложений: ({}, {}]", reserveSentenceRatingUpperBound, maxRating);
+        log.info("\tСреднее значение рейтинга предложений: {}", avgRating);
+        log.info("\tДиапазон \"резервных\" предложений: [{}, {}]", reserveSentenceRatingLowerBound, reserveSentenceRatingUpperBound);
 
 
         // Формируем пул главных предложений (важен порядок)
         // Также все главные предложения будут маркироваться - избыточные или нет
-        Set<MarkedSentence> generalSentences = new LinkedHashSet<>();
+        Set<Sentence> generalSentences = new HashSet<>();
         // Пул резервных предложений (все те предложения которые попали в серединный рейтинг)
-        Set<Sentence> reserveSentences = new LinkedHashSet<>();
+        Set<Sentence> reserveSentences = new HashSet<>();
 
         // Классифицируем предложения на главные и резервные
-        // Все главные предложения маркируются - избыточные, не избыточные
-        classifyAndMarkSentences(generalSentences, reserveSentences);
+        classifySentences(generalSentences, reserveSentences);
 
-        // Удаляем избыточность
-        Set<Sentence> resultAbstractSentences = removeOversupply(generalSentences, reserveSentences);
-
-        // Выделяем все отобранные слова из оригинального текста с соблюдением последовательности
-        List<Sentence> resultAbstract = getHighlightedSentencesFromText(originalSentencesOrderList, resultAbstractSentences);
-
-        // Если получаем реферат больше чем максимально разрешенное количество, то сокращаем результат
-        if (resultAbstract.size() < maxAbstractSentenceCount) {
-            // Вычисляем с какой периодичностью мы будем брать предложения
-            int nth = 100 / maxAbstractSizeInPercent;
-            log.info(
-                    "Количество отобранных предложений превышает {}% исходного текста.",
-                    maxAbstractSizeInPercent
+        Set<Sentence> resultAbstractSentences = generalSentences;
+        // Если количество основных предложений больше максимального количества предложений реферата
+        if (resultAbstractSentences.size() > maxAbstractSentenceCount) {
+//             Устраняем избыточность
+            resultAbstractSentences = removeOversupplySentences(
+                    markOversupplySentences(generalSentences),
+                    reserveSentences
             );
-            log.info("Выбираем каждое {} из отобранных", nth);
 
-            resultAbstract = IntStream.range(0, resultAbstract.size())
-                    .filter(n -> n % nth == 0)
-                    .mapToObj(resultAbstract::get)
-                    .toList();
+            // Если по прежнему больше обрезаем количество предложений до максимального
+            if (resultAbstractSentences.size() > maxAbstractSentenceCount) {
+                resultAbstractSentences = resultAbstractSentences.stream()
+                        .limit(maxAbstractSentenceCount)
+                        .collect(Collectors.toSet());
+            }
+        }else if (resultAbstractSentences.size() < maxAbstractSentenceCount) {
+            // Если предложений меньше, чем максимально разрешенное количество предложений добираем из резерва
+            resultAbstractSentences = mergeGeneralAndReserveForMaxSize(generalSentences, reserveSentences);
+        } else {
+            // иначе ничего не делаем, наш реферат состоит из основных предложений
+            log.info("Реферат полностью состоит из главных предложений!");
         }
 
+        // Выделяем предложения из оригинала для
+        List<Sentence> resultAbstract = getHighlightedSentencesFromOriginal(resultAbstractSentences);
         writeAbstract(output, resultAbstract);
         log.info("Текст был успешно отреферирован.");
     }
 
-    // Классифицируем предложения на главные и резервные
-    // и маркирует избыточные предложения которые попадают в класс главных
-    private void classifyAndMarkSentences(Set<MarkedSentence> generalSentences, Set<Sentence> reserveSentences) {
-        log.info("Классификация предложений - основные и резервные");
-        log.info("Определение избыточности основных предложений с помощью словаря синонимов {}", synonymDictionary);
+    private void classifySentences(Set<Sentence> general, Set<Sentence> reserve) {
+        log.info("Классификация предложений на основные и резервные...");
         originalSentencesOrderList.forEach(s -> {
             if (s.rating > reserveSentenceRatingUpperBound) {
-                // Если предложение главное
-                // На каждое предложение вешаем маркер - избыточное или нет
-                var ms = new MarkedSentence(s);
-
-                // Каждое предложение проверяем на избыточность со всеми уже добавленными не избыточными предложениям
-                Iterator<MarkedSentence> generalIter = generalSentences.iterator();
-                while (!ms.isOversupply && generalIter.hasNext()) {
-                    MarkedSentence g = generalIter.next();
-                    if (!g.isOversupply) {
-                        // Проверяем на избыточность, если хотя бы одно из предложений
-                        // избыточно ему устанавливается соответсвующий маркер
-                        checkAndSetOversupplyFlags(ms, g);
-                    }
-                }
-                // Добавляем в список основных предложений
-                generalSentences.add(ms);
+                // Если текущее предложение выше верхней средней границы, определяем предложение как основное
+                general.add(s);
             } else if (s.rating >= reserveSentenceRatingLowerBound) {
-                // Если предложение резервное -> добавляем в резерв
-                reserveSentences.add(s);
+                // Если текущее предложение ниже верхней средней границы, но выше нижней средней границы
+                // определяем как резервное
+                reserve.add(s);
             }
+            // иначе предложение исключается
         });
+        log.info("\t Количество основных предложений: {}", general.size());
+        log.info("\t Количество резервных предложений: {}", reserve.size());
     }
 
-    // Заменяет избыточные предложения предложениями из резерва пока они не закончатся
-    private Set<Sentence> removeOversupply(Set<MarkedSentence> general, Set<Sentence> reserve) {
-        log.info("Количество главных предложений: {}", general.size());
-        log.info("Количество \"резервных\" предложений: {}", reserve.size());
 
-        log.info("Удаление избыточных предложений");
+    // Определяет избыточные главные предложения и заменяет их на резервные
+    // Если резервные предложения закончились, просто удаляет избыточность
+    private Set<Sentence> removeOversupplySentences(Set<MarkedSentence> checkedOversupplySentences, Set<Sentence> reserve) {
+        log.info("Удаление избыточных предложений...");
         Iterator<Sentence> reserveIter = reserve.iterator();
-        AtomicInteger countReplaced = new AtomicInteger();
-        Set<Sentence> withoutOversupply = general.stream()
-                .map(s -> {
-                    // Если избыточность, то смотрим есть ли резервные
-                    // есть -> значит возвращаем
-                    // если нет -> возвращаем предложение, несмотря на его избыточность
-                    if (s.isOversupply && reserveIter.hasNext()) {
-                        countReplaced.getAndIncrement();
-                        return reserveIter.next();
-                    } else {
-                        return s.sentence;
-                    }
-                })
-                .collect(Collectors.toSet());
 
-        log.info("Количество замен избыточных главных предложений на резервные: {}", countReplaced);
+        int countReplaced = 0;
+        int countRemoved = 0;
+        Set<Sentence> withoutOversupply = new HashSet<>();
+        for (MarkedSentence s : checkedOversupplySentences) {
+            // Если избыточное предложение
+            if (s.isOversupply) {
+                // И есть резервное для замены
+                if (reserveIter.hasNext()) {
+                    countReplaced++;
+                    // заменяем избыточное на резервное
+                    withoutOversupply.add(reserveIter.next());
+                } else {
+                    // Если резервных нет значит удаляем избыточное
+                    countRemoved++;
+                }
+            } else {
+                // Если не избыточное, то пропускаем для реферата
+                withoutOversupply.add(s.sentence);
+            }
+        }
+        log.info("\tКоличество предложений после удаления избыточности: {}", withoutOversupply.size());
+        log.info("\tЗамен избыточных на резервные: {}", countReplaced);
+        log.info("\tУдалений избыточных предложений: {}", countRemoved);
 
         return withoutOversupply;
+    }
+
+    // Ищет и маркирует избыточные предложения
+    private Set<MarkedSentence> markOversupplySentences(Set<Sentence> sentences){
+        log.info("Поиск избыточных главных предложений...");
+        log.info("\tМаксимальный процент избыточности: {}% синонимов", MAX_SENTENCE_OVERSUPPLY_IN_PERCENT);
+        log.info("\tСловарь синонимов: {}", synonymDictionary);
+        Set<MarkedSentence> markedOversupplySentences = new HashSet<>();
+        AtomicInteger oversupplyCount = new AtomicInteger();
+        sentences.forEach(s -> {
+            var ms = new MarkedSentence(s);
+
+            // Каждое предложение проверяем на избыточность со всеми уже добавленными не избыточными предложениям
+            Iterator<MarkedSentence> generalIter = markedOversupplySentences.iterator();
+            while (!ms.isOversupply && generalIter.hasNext()) {
+                MarkedSentence g = generalIter.next();
+                if (!g.isOversupply) {
+                    // Проверяем на избыточность, если хотя бы одно из предложений
+                    // избыточно ему устанавливается соответсвующий маркер
+                    checkAndSetOversupplyFlags(ms, g);
+                    if (ms.isOversupply) {
+                        oversupplyCount.getAndIncrement();
+                    }
+                    if (g.isOversupply){
+                        oversupplyCount.getAndIncrement();
+                    }
+                }
+            }
+            markedOversupplySentences.add(ms);
+        });
+        log.info("\tБыло найдено избыточных предложений: {}", oversupplyCount.get());
+
+        return markedOversupplySentences;
     }
 
     // Проверяет избыточность двух предложений и если
@@ -195,9 +234,24 @@ public class AcsiMatic implements AbstractingMethod {
         second.isOversupply = secondSynonymsPercent > MAX_SENTENCE_OVERSUPPLY_IN_PERCENT;
     }
 
-    private List<Sentence> getHighlightedSentencesFromText(List<Sentence> textSentences,
-                                                           Set<Sentence> highlightedSentences) {
-        return textSentences.stream()
+    // Добирает недостающие предложения для основных предложений из резерва с учетом максимального количества
+    // предложений в реферате
+    private Set<Sentence> mergeGeneralAndReserveForMaxSize(Set<Sentence> general, Set<Sentence> reserve){
+        log.info("Добор предложений из резерва...");
+        Set<Sentence> result = new HashSet<>(general);
+        Iterator<Sentence> reserveIter = reserve.iterator();
+        int reserveCount = 0;
+        while (result.size() < maxAbstractSentenceCount && reserveIter.hasNext()){
+            reserveCount++;
+            result.add(reserveIter.next());
+        }
+        log.info("\tКоличество добранных предложений из резервных {}", reserveCount);
+        log.info("\tКоличество предложений после добора: {}", result.size());
+        return result;
+    }
+
+    private List<Sentence> getHighlightedSentencesFromOriginal(Set<Sentence> highlightedSentences) {
+        return originalSentencesOrderList.stream()
                 .filter(highlightedSentences::contains)
                 .toList();
     }

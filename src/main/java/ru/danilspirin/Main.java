@@ -27,7 +27,7 @@ public class Main {
         OutputStream output = System.out;
 
         new AcsiMatic(wordSynonymAnalyzer)
-                .useMaxAbstractSize(50)
+                .useAbstractLimit(20)
                 .process(input, output);
 
         redis.shutdown();
